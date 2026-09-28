@@ -78,6 +78,10 @@ mod tests {
     const PROOF_REGISTER_BATCH_MAX_MEM_MAX: u64 = 1_750_000;
     const PROOF_REGISTER_WITH_ACTIVATION_CPU_MAX: u64 = 800_000;
     const PROOF_REGISTER_WITH_ACTIVATION_MEM_MAX: u64 = 250_000;
+    const PROOF_OPEN_DISPUTE_CPU_MAX: u64 = 500_000;
+    const PROOF_OPEN_DISPUTE_MEM_MAX: u64 = 180_000;
+    const PROOF_RESOLVE_DISPUTE_CPU_MAX: u64 = 400_000;
+    const PROOF_RESOLVE_DISPUTE_MEM_MAX: u64 = 150_000;
 
     // -----------------------------------------------------------------------
     // Test Utilities
@@ -583,6 +587,47 @@ mod tests {
             "proof_registry.register_proof_with_activation",
             PROOF_REGISTER_WITH_ACTIVATION_CPU_MAX,
             PROOF_REGISTER_WITH_ACTIVATION_MEM_MAX,
+        );
+    }
+
+    #[test]
+    fn proof_registry_open_dispute_budget() {
+        let env = Env::default();
+        let (proof_client, _protocol, _issuer_registry, issuer) = setup_proof_registry(&env);
+
+        let proof_id = bytes(&env, 1);
+        proof_client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        env.cost_estimate().budget().reset_unlimited();
+
+        proof_client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        assert_budget(
+            &env,
+            "proof_registry.open_dispute",
+            PROOF_OPEN_DISPUTE_CPU_MAX,
+            PROOF_OPEN_DISPUTE_MEM_MAX,
+        );
+    }
+
+    #[test]
+    fn proof_registry_resolve_dispute_budget() {
+        let env = Env::default();
+        let (proof_client, _protocol, _issuer_registry, issuer) = setup_proof_registry(&env);
+
+        let proof_id = bytes(&env, 1);
+        proof_client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        proof_client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        env.cost_estimate().budget().reset_unlimited();
+
+        proof_client.resolve_dispute(&proof_id);
+
+        assert_budget(
+            &env,
+            "proof_registry.resolve_dispute",
+            PROOF_RESOLVE_DISPUTE_CPU_MAX,
+            PROOF_RESOLVE_DISPUTE_MEM_MAX,
         );
     }
 

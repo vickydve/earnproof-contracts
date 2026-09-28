@@ -106,6 +106,9 @@ A Soroban contract error is a type and a number. It carries no message, no paylo
 | 310 | `MalformedInput` | `ProofError` | proof-registry | reserved | after-caller-change | 400 |
 | 311 | `InvalidBatchSize` | `ProofError` | proof-registry | returned | after-caller-change | 400 |
 | 312 | `InvalidActivationTime` | `ProofError` | proof-registry | returned | after-caller-change | 400 |
+| 313 | `DisputeAlreadyOpen` | `ProofError` | proof-registry | returned | never | 409 |
+| 314 | `DisputeNotFound` | `ProofError` | proof-registry | returned | after-caller-change | 404 |
+| 315 | `DisputeNotOpen` | `ProofError` | proof-registry | returned | never | 400 |
 
 ## Details
 
@@ -405,5 +408,38 @@ A Soroban contract error is a type and a number. It carries no message, no paylo
 - Remediation: Choose an activation time strictly before the expiration.
 - Suggested HTTP status: 400
 - Client message: "Invalid activation time"
+
+### 313 - `DisputeAlreadyOpen`
+
+- Enum: `ProofError`
+- Domain: proof-registry
+- Status: returned
+- Retry: never
+- Cause: open_dispute was called for a proof that already has an Open dispute.
+- Remediation: Withdraw, resolve, or reject the existing dispute before opening a new one. Retrying the identical request will not help: the dispute is cleared by a different call (from the disputant or the admin), not by this one succeeding on its own.
+- Suggested HTTP status: 409
+- Client message: "A dispute is already open for this proof"
+
+### 314 - `DisputeNotFound`
+
+- Enum: `ProofError`
+- Domain: proof-registry
+- Status: returned
+- Retry: after-caller-change
+- Cause: withdraw_dispute, resolve_dispute, or reject_dispute referenced a proof with no dispute record.
+- Remediation: Open a dispute first, or confirm the proof id.
+- Suggested HTTP status: 404
+- Client message: "No dispute found for this proof"
+
+### 315 - `DisputeNotOpen`
+
+- Enum: `ProofError`
+- Domain: proof-registry
+- Status: returned
+- Retry: never
+- Cause: A dispute transition was attempted on a dispute that is not Open (already withdrawn, resolved, or rejected).
+- Remediation: Read the dispute's current status; it is terminal once withdrawn, resolved, or rejected.
+- Suggested HTTP status: 400
+- Client message: "Dispute is not open"
 
 <!-- END GENERATED -->

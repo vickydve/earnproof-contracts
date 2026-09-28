@@ -349,6 +349,32 @@ fn every_returned_code_is_produced_by_a_real_failure_path() {
         )),
     );
 
+    // 313: DisputeAlreadyOpen — opening a second dispute while one is open.
+    initial_dep
+        .proofs
+        .open_dispute(&proof_id, &initial_dep.issuer, &bytes32(env, 80));
+    observed.record(
+        "proof-registry dispute already open",
+        code(initial_dep.proofs.try_open_dispute(
+            &proof_id,
+            &initial_dep.issuer,
+            &bytes32(env, 81),
+        )),
+    );
+
+    // 314: DisputeNotFound — no dispute exists for this proof.
+    observed.record(
+        "proof-registry dispute not found",
+        code(initial_dep.proofs.try_withdraw_dispute(&bytes32(env, 99))),
+    );
+
+    // 315: DisputeNotOpen — the dispute above is withdrawn, then acted on again.
+    initial_dep.proofs.withdraw_dispute(&proof_id);
+    observed.record(
+        "proof-registry dispute not open",
+        code(initial_dep.proofs.try_withdraw_dispute(&proof_id)),
+    );
+
     // Every catalogued `Returned` code must appear at least once above.
     for entry in ERROR_CATALOG {
         if entry.status == Status::Returned {

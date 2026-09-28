@@ -106,6 +106,16 @@ pub struct ProofRegisteredInBatch {
     pub issuer_address: Address,
 }
 
+/// Emitted once per proof successfully revoked via `revoke_proofs_batch` or
+/// `admin_revoke_proofs_batch`, in the same order the identifiers were
+/// supplied. `revoked_by` is the proof's own issuer address for the former
+/// and the admin address for the latter.
+#[contractevent]
+pub struct ProofRevokedInBatch {
+    pub proof_id_hash: BytesN<32>,
+    pub revoked_by: Address,
+}
+
 #[contractimpl]
 impl ProofRegistryContract {
     pub fn is_decommissioned(env: Env) -> bool {
@@ -392,6 +402,32 @@ impl ProofRegistryContract {
 
     pub fn admin_revoke_proof(env: Env, proof_id_hash: BytesN<32>) -> Result<(), ProofError> {
         Self::set_revoked(env, proof_id_hash, true)
+    }
+
+    /// Revokes a strictly bounded batch of proofs, atomically, authorizing
+    /// each entry against its own recorded issuer address — mirroring
+    /// `revoke_proof`'s per-item authorization so a batch may mix proofs
+    /// owned by different issuers as long as every one of those issuers
+    /// signs the invocation.
+    ///
+    /// See [`Self::admin_revoke_proofs_batch`] for the admin-authorized
+    /// variant, and [`Self::revoke_batch`] for the shared atomicity and
+    /// per-entry outcome rules both share.
+    pub fn revoke_proofs_batch(
+        env: Env,
+        proof_id_hashes: Vec<BytesN<32>>,
+    ) -> Result<(), ProofError> {
+        Self::revoke_batch(env, proof_id_hashes, false)
+    }
+
+    /// Admin-authorized counterpart of [`Self::revoke_proofs_batch`]: a
+    /// single admin authorization covers every entry in the batch,
+    /// regardless of which issuer originally registered each proof.
+    pub fn admin_revoke_proofs_batch(
+        env: Env,
+        proof_id_hashes: Vec<BytesN<32>>,
+    ) -> Result<(), ProofError> {
+        Self::revoke_batch(env, proof_id_hashes, true)
     }
 
     pub fn get_proof(env: Env, proof_id_hash: BytesN<32>) -> Result<ProofRecord, ProofError> {
@@ -697,6 +733,93 @@ impl ProofRegistryContract {
         Ok(())
     }
 
+    /// Shared implementation behind [`Self::revoke_proofs_batch`] and
+    /// [`Self::admin_revoke_proofs_batch`].
+    ///
+    /// Entries are processed in order, and the whole call is atomic: if any
+    /// entry fails (unknown proof id, an unauthorized issuer, or an entry
+    /// already revoked — whether it was already revoked on chain or revoked
+    /// earlier in this same batch), the call returns that entry's error and
+    /// every write and event already produced earlier in this same call is
+    /// discarded along with it, per Soroban's invocation semantics. A
+    /// repeated identifier within one batch is therefore a documented
+    /// failure of the whole batch, not a silently-skipped duplicate — the
+    /// same outcome as revoking an already-revoked proof.
+    ///
+    /// The pause check and (for the admin path) admin authorization are each
+    /// performed once for the whole batch, reusing `set_revoked`'s checks.
+    /// For the issuer path, authorization is instead performed per entry
+    /// against that entry's own recorded `issuer_address`, so an entry the
+    /// caller is not authorized for can never be hidden behind valid entries
+    /// earlier in the batch: `require_auth` aborts the entire invocation the
+    /// moment it fails.
+    fn revoke_batch(
+        env: Env,
+        proof_id_hashes: Vec<BytesN<32>>,
+        by_admin: bool,
+    ) -> Result<(), ProofError> {
+        Self::ensure_not_decommissioned(&env)?;
+
+        let len = proof_id_hashes.len();
+        if len == 0 || len > MAX_PROOF_BATCH_SIZE {
+            return Err(ProofError::InvalidBatchSize);
+        }
+
+        if let Ok(protocol_config) = Self::get_protocol_config(env.clone()) {
+            let protocol_client = ProtocolConfigContractClient::new(&env, &protocol_config);
+            if protocol_client.is_scope_paused(&PauseScope::Revocation) {
+                return Err(ProofError::ProofNotFound);
+            }
+        }
+
+        // Admin authorization is shared across the whole batch; the issuer
+        // path instead authorizes per entry below, against each entry's own
+        // recorded issuer.
+        let admin = if by_admin {
+            let admin = Self::get_admin(env.clone()).map_err(|_| ProofError::ProofNotFound)?;
+            Self::require_auth(&admin);
+            Some(admin)
+        } else {
+            None
+        };
+
+        let now = env.ledger().timestamp();
+
+        for proof_id_hash in proof_id_hashes.iter() {
+            let key = DataKey::Proof(proof_id_hash.clone());
+            let mut record: ProofRecord = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .ok_or(ProofError::ProofNotFound)?;
+
+            let revoked_by = match &admin {
+                Some(admin) => admin.clone(),
+                None => {
+                    Self::require_auth(&record.issuer_address);
+                    record.issuer_address.clone()
+                }
+            };
+
+            if record.status == ProofStatus::Revoked {
+                return Err(ProofError::ProofAlreadyRevoked);
+            }
+
+            record.status = ProofStatus::Revoked;
+            record.revoked_at = now;
+            env.storage().persistent().set(&key, &record);
+            Self::extend_proof_key_ttl(env.clone(), &key);
+
+            ProofRevokedInBatch {
+                proof_id_hash: proof_id_hash.clone(),
+                revoked_by,
+            }
+            .publish(&env);
+        }
+
+        Ok(())
+    }
+
     fn extend_instance_ttl(env: Env) {
         env.storage()
             .instance()
@@ -794,7 +917,9 @@ mod test {
     extern crate std;
 
     use super::{DataKey, ProofRegistryContract, ProofRegistryContractClient};
-    use earnproof_shared::{ProofError, ProofStatus, TTL_THRESHOLD_LEDGERS};
+    use earnproof_shared::{
+        PauseScope, ProofError, ProofStatus, MAX_PROOF_BATCH_SIZE, TTL_THRESHOLD_LEDGERS,
+    };
     use issuer_registry::{IssuerRegistryContract, IssuerRegistryContractClient};
     use protocol_config::{ProtocolConfigContract, ProtocolConfigContractClient};
     use soroban_sdk::{testutils::storage::Persistent as _, Address, BytesN, Env};
@@ -1952,7 +2077,7 @@ mod test {
 
     // ── bounded batch proof registration ─────────────────────────────────────
 
-    use earnproof_shared::{ProofRegistrationInput, MAX_PROOF_BATCH_SIZE};
+    use earnproof_shared::ProofRegistrationInput;
 
     fn batch_input(env: &Env, seed: u8, expires_at: u64) -> ProofRegistrationInput {
         ProofRegistrationInput {
@@ -2224,5 +2349,343 @@ mod test {
         let batch = make_batch(&env, &[1], 2_000);
         let result = client.try_register_proofs_batch(&batch, &issuer);
         assert_eq!(result, Err(Ok(ProofError::ProofNotFound)));
+    }
+
+    // ── bounded batch proof revocation ───────────────────────────────────────
+
+    const ISSUER_TWO: &str = "GDWUSKGGFDI4FRXK5EBTRECZSVQSSWJHHJOGH6JWG3AUMFFMQ435DIAG";
+
+    fn ids(env: &Env, seeds: &[u8]) -> soroban_sdk::Vec<BytesN<32>> {
+        let mut v = soroban_sdk::Vec::new(env);
+        for &seed in seeds {
+            v.push_back(bytes(env, seed));
+        }
+        v
+    }
+
+    #[test]
+    fn revoke_proofs_batch_revokes_every_entry_in_order() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let seeds = [1u8, 2, 3];
+        for &seed in &seeds {
+            client.register_proof(
+                &bytes(&env, seed),
+                &bytes(&env, seed + 100),
+                &issuer,
+                &1,
+                &2_000,
+            );
+        }
+
+        client.revoke_proofs_batch(&ids(&env, &seeds));
+
+        for &seed in &seeds {
+            assert!(client.is_revoked(&bytes(&env, seed)));
+            assert!(!client.is_valid_proof(&bytes(&env, seed)));
+        }
+    }
+
+    #[test]
+    fn revoke_proofs_batch_emits_events_in_input_order() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScAddress, ScVal};
+        use soroban_sdk::{Map, Symbol, TryFromVal, Val};
+
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let seeds = [5u8, 6, 7];
+        for &seed in &seeds {
+            client.register_proof(
+                &bytes(&env, seed),
+                &bytes(&env, seed + 100),
+                &issuer,
+                &1,
+                &2_000,
+            );
+        }
+
+        client.revoke_proofs_batch(&ids(&env, &seeds));
+
+        let events = env.events().all();
+        let proof_ids_in_event_order: std::vec::Vec<BytesN<32>> = events
+            .events()
+            .iter()
+            .filter_map(|event| {
+                let contract_id = event.contract_id.clone()?;
+                let emitting_contract =
+                    Address::try_from_val(&env, &ScVal::Address(ScAddress::Contract(contract_id)))
+                        .ok()?;
+                if emitting_contract != client.address {
+                    return None;
+                }
+                let ContractEventBody::V0(body) = &event.body;
+                let first_topic = body.topics.first()?;
+                let first_topic_val = Val::try_from_val(&env, first_topic).ok()?;
+                let discriminant = Symbol::try_from_val(&env, &first_topic_val).ok()?;
+                if discriminant != Symbol::new(&env, "proof_revoked_in_batch") {
+                    return None;
+                }
+                let data_val = Val::try_from_val(&env, &body.data).ok()?;
+                let map = Map::<Symbol, Val>::try_from_val(&env, &data_val).ok()?;
+                let raw = map.get(Symbol::new(&env, "proof_id_hash"))?;
+                BytesN::<32>::try_from_val(&env, &raw).ok()
+            })
+            .collect();
+
+        assert_eq!(
+            proof_ids_in_event_order,
+            std::vec![bytes(&env, 5), bytes(&env, 6), bytes(&env, 7)]
+        );
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_empty_batch() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let empty: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::Vec::new(&env);
+
+        let result = client.try_revoke_proofs_batch(&empty);
+        assert_eq!(result, Err(Ok(ProofError::InvalidBatchSize)));
+    }
+
+    #[test]
+    fn revoke_proofs_batch_accepts_exact_limit_batch() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let seeds: std::vec::Vec<u8> = (0..MAX_PROOF_BATCH_SIZE as u16).map(|i| i as u8).collect();
+        for &seed in &seeds {
+            client.register_proof(
+                &bytes(&env, seed),
+                &bytes(&env, seed.wrapping_add(100)),
+                &issuer,
+                &1,
+                &2_000,
+            );
+        }
+
+        client.revoke_proofs_batch(&ids(&env, &seeds));
+
+        for &seed in &seeds {
+            assert!(client.is_revoked(&bytes(&env, seed)));
+        }
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_over_limit_batch() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let seeds: std::vec::Vec<u8> = (0..(MAX_PROOF_BATCH_SIZE as u16 + 1))
+            .map(|i| i as u8)
+            .collect();
+        for &seed in &seeds {
+            client.register_proof(
+                &bytes(&env, seed),
+                &bytes(&env, seed.wrapping_add(100)),
+                &issuer,
+                &1,
+                &2_000,
+            );
+        }
+
+        let result = client.try_revoke_proofs_batch(&ids(&env, &seeds));
+        assert_eq!(result, Err(Ok(ProofError::InvalidBatchSize)));
+
+        for &seed in &seeds {
+            assert!(!client.is_revoked(&bytes(&env, seed)));
+        }
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_duplicate_within_batch() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer, &1, &2_000);
+        client.register_proof(&bytes(&env, 2), &bytes(&env, 102), &issuer, &1, &2_000);
+
+        let batch = ids(&env, &[1, 2, 1]); // duplicate of the first
+        let result = client.try_revoke_proofs_batch(&batch);
+        assert_eq!(result, Err(Ok(ProofError::ProofAlreadyRevoked)));
+
+        // Atomicity: even the entries that would have succeeded must not be committed.
+        assert!(!client.is_revoked(&bytes(&env, 1)));
+        assert!(!client.is_revoked(&bytes(&env, 2)));
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_already_revoked_entry() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer, &1, &2_000);
+        client.register_proof(&bytes(&env, 2), &bytes(&env, 102), &issuer, &1, &2_000);
+        client.revoke_proof(&bytes(&env, 1));
+
+        let batch = ids(&env, &[2, 1]);
+        let result = client.try_revoke_proofs_batch(&batch);
+        assert_eq!(result, Err(Ok(ProofError::ProofAlreadyRevoked)));
+
+        // Entry 2 preceded the failing entry and must not have been committed.
+        assert!(!client.is_revoked(&bytes(&env, 2)));
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_unknown_proof_id() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer, &1, &2_000);
+
+        let batch = ids(&env, &[1, 99]);
+        let result = client.try_revoke_proofs_batch(&batch);
+        assert_eq!(result, Err(Ok(ProofError::ProofNotFound)));
+        assert!(!client.is_revoked(&bytes(&env, 1)));
+    }
+
+    #[test]
+    fn revoke_proofs_batch_supports_mixed_ownership_when_every_issuer_authorizes() {
+        let (env, client, _pc, ir, _ir_id) = setup();
+        let issuer_one = Address::from_str(&env, ISSUER);
+        let issuer_two = Address::from_str(&env, ISSUER_TWO);
+        ir.register_issuer(
+            &bytes(&env, 20),
+            &issuer_two,
+            &bytes(&env, 21),
+            &bytes(&env, 99),
+        );
+
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer_one, &1, &2_000);
+        client.register_proof(&bytes(&env, 2), &bytes(&env, 102), &issuer_two, &1, &2_000);
+
+        // env.mock_all_auths() (from setup()) authorizes every address, so a
+        // mixed-ownership batch succeeds when both issuers would sign.
+        client.revoke_proofs_batch(&ids(&env, &[1, 2]));
+
+        assert!(client.is_revoked(&bytes(&env, 1)));
+        assert!(client.is_revoked(&bytes(&env, 2)));
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_mixed_ownership_without_the_second_issuers_auth() {
+        use soroban_sdk::IntoVal;
+
+        let (env, client, _pc, ir, _ir_id) = setup();
+        let issuer_one = Address::from_str(&env, ISSUER);
+        let issuer_two = Address::from_str(&env, ISSUER_TWO);
+        ir.register_issuer(
+            &bytes(&env, 20),
+            &issuer_two,
+            &bytes(&env, 21),
+            &bytes(&env, 99),
+        );
+
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer_one, &1, &2_000);
+        client.register_proof(&bytes(&env, 2), &bytes(&env, 102), &issuer_two, &1, &2_000);
+
+        // Only issuer_one is authorized for this invocation; issuer_two's
+        // entry must not be smuggled through behind it.
+        env.set_auths(&[]);
+        let auth_entry = soroban_sdk::testutils::MockAuth {
+            address: &issuer_one,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "revoke_proofs_batch",
+                args: (ids(&env, &[1, 2]),).into_val(&env),
+                sub_invokes: &[],
+            },
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client
+                .mock_auths(&[auth_entry])
+                .revoke_proofs_batch(&ids(&env, &[1, 2]));
+        }));
+        assert!(
+            result.is_err(),
+            "batch must fail without issuer_two's authorization"
+        );
+        assert!(!client.is_revoked(&bytes(&env, 1)));
+        assert!(!client.is_revoked(&bytes(&env, 2)));
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_when_revocation_paused() {
+        let (env, client, pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer, &1, &2_000);
+        pc.set_scoped_pause(&PauseScope::Revocation, &true);
+
+        let result = client.try_revoke_proofs_batch(&ids(&env, &[1]));
+        assert_eq!(result, Err(Ok(ProofError::ProofNotFound)));
+        assert!(!client.is_revoked(&bytes(&env, 1)));
+    }
+
+    #[test]
+    fn revoke_proofs_batch_rejects_decommissioned_contract() {
+        let (env, client, ..) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let admin = Address::from_str(&env, ADMIN);
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer, &1, &2_000);
+        client.nominate_successor(&admin);
+        client.activate_successor();
+
+        let result = client.try_revoke_proofs_batch(&ids(&env, &[1]));
+        assert_eq!(result, Err(Ok(ProofError::ProofNotFound)));
+    }
+
+    #[test]
+    fn admin_revoke_proofs_batch_revokes_every_entry() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let seeds = [1u8, 2, 3];
+        for &seed in &seeds {
+            client.register_proof(
+                &bytes(&env, seed),
+                &bytes(&env, seed + 100),
+                &issuer,
+                &1,
+                &2_000,
+            );
+        }
+
+        client.admin_revoke_proofs_batch(&ids(&env, &seeds));
+
+        for &seed in &seeds {
+            assert!(client.is_revoked(&bytes(&env, seed)));
+        }
+    }
+
+    #[test]
+    fn admin_revoke_proofs_batch_requires_admin_auth() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer, &1, &2_000);
+
+        env.set_auths(&[]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.admin_revoke_proofs_batch(&ids(&env, &[1]));
+        }));
+        assert!(
+            result.is_err(),
+            "admin batch revocation must require admin auth"
+        );
+        assert!(!client.is_revoked(&bytes(&env, 1)));
+    }
+
+    #[test]
+    fn admin_revoke_proofs_batch_can_revoke_proofs_from_multiple_issuers_with_one_auth() {
+        let (env, client, _pc, ir, _ir_id) = setup();
+        let issuer_one = Address::from_str(&env, ISSUER);
+        let issuer_two = Address::from_str(&env, ISSUER_TWO);
+        ir.register_issuer(
+            &bytes(&env, 20),
+            &issuer_two,
+            &bytes(&env, 21),
+            &bytes(&env, 99),
+        );
+        client.register_proof(&bytes(&env, 1), &bytes(&env, 101), &issuer_one, &1, &2_000);
+        client.register_proof(&bytes(&env, 2), &bytes(&env, 102), &issuer_two, &1, &2_000);
+
+        // Only the admin needs to authorize; neither issuer does.
+        client.admin_revoke_proofs_batch(&ids(&env, &[1, 2]));
+
+        assert!(client.is_revoked(&bytes(&env, 1)));
+        assert!(client.is_revoked(&bytes(&env, 2)));
     }
 }

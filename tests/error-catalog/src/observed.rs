@@ -323,15 +323,27 @@ fn every_returned_code_is_produced_by_a_real_failure_path() {
     );
 
     // 311: InvalidBatchSize — an empty batch is rejected before any
-    // cross-contract call is made.
-    let empty_batch: soroban_sdk::Vec<earnproof_shared::ProofRegistrationInput> =
+    // cross-contract call is made, on both the registration and revocation
+    // paths.
+    let empty_registration_batch: soroban_sdk::Vec<earnproof_shared::ProofRegistrationInput> =
         soroban_sdk::Vec::new(env);
     observed.record(
-        "proof-registry batch with zero entries",
+        "proof-registry registration batch with zero entries",
         code(
             initial_dep
                 .proofs
-                .try_register_proofs_batch(&empty_batch, &initial_dep.issuer),
+                .try_register_proofs_batch(&empty_registration_batch, &initial_dep.issuer),
+        ),
+    );
+
+    let empty_revocation_batch: soroban_sdk::Vec<soroban_sdk::BytesN<32>> =
+        soroban_sdk::Vec::new(env);
+    observed.record(
+        "proof-registry revocation batch with zero entries",
+        code(
+            initial_dep
+                .proofs
+                .try_revoke_proofs_batch(&empty_revocation_batch),
         ),
     );
 

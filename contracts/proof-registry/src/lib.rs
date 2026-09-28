@@ -2,9 +2,10 @@
 
 #[allow(unused_imports)]
 use earnproof_shared::{
-    ContractError, MigrationStatus, PauseScope, ProofError, ProofRecord, ProofRegistrationInput,
-    ProofStatus, ProofValidity, TtlStatus, UpgradeApproval, UpgradeReceipt, MAX_MIGRATION_BATCH,
-    MAX_PROOF_BATCH_SIZE, MIGRATION_STATUS_VERSION, TTL_EXTEND_TO_LEDGERS, TTL_THRESHOLD_LEDGERS,
+    ContractError, DisputeActorClass, DisputeRecord, DisputeStatus, MigrationStatus, PauseScope,
+    ProofError, ProofRecord, ProofRegistrationInput, ProofStatus, ProofValidity, TtlStatus,
+    UpgradeApproval, UpgradeReceipt, MAX_MIGRATION_BATCH, MAX_PROOF_BATCH_SIZE,
+    MIGRATION_STATUS_VERSION, TTL_EXTEND_TO_LEDGERS, TTL_THRESHOLD_LEDGERS,
 };
 use soroban_sdk::{
     contract, contractclient, contractevent, contractimpl, contracttype, Address, BytesN, Env, Vec,
@@ -25,6 +26,14 @@ pub trait IssuerRegistryInterface {
 #[contract]
 pub struct ProofRegistryContract;
 
+/// Internal selector for the shared terminal-transition logic in
+/// `transition_dispute`. Not exposed across the contract boundary.
+enum DisputeTransition {
+    Withdraw,
+    Resolve,
+    Reject,
+}
+
 #[contracttype]
 enum DataKey {
     MigrationStatus,
@@ -32,6 +41,7 @@ enum DataKey {
     IssuerRegistry,
     ProtocolConfig,
     Proof(BytesN<32>),
+    Dispute(BytesN<32>),
     /// Allowlist entry: maps a WASM hash to the target contract version.
     AllowedWasm(BytesN<32>),
     /// Monotonically-increasing contract version.  Prevents downgrade.
@@ -104,6 +114,44 @@ pub struct ContractDecommissioned {
 pub struct ProofRegisteredInBatch {
     pub proof_id_hash: BytesN<32>,
     pub issuer_address: Address,
+}
+
+// ── dispute events ───────────────────────────────────────────────────────────
+
+/// Emitted when a dispute is opened against a proof.
+#[contractevent]
+pub struct DisputeOpened {
+    pub proof_id_hash: BytesN<32>,
+    pub opened_by: Address,
+    pub opened_by_class: DisputeActorClass,
+    pub opened_at: u64,
+}
+
+/// Emitted when the disputant withdraws their own open dispute.
+#[contractevent]
+pub struct DisputeWithdrawn {
+    pub proof_id_hash: BytesN<32>,
+    pub withdrawn_by: Address,
+    pub withdrawn_by_class: DisputeActorClass,
+    pub withdrawn_at: u64,
+}
+
+/// Emitted when the admin resolves an open dispute in the disputant's favor.
+#[contractevent]
+pub struct DisputeResolved {
+    pub proof_id_hash: BytesN<32>,
+    pub resolved_by: Address,
+    pub resolved_by_class: DisputeActorClass,
+    pub resolved_at: u64,
+}
+
+/// Emitted when the admin rejects an open dispute as without merit.
+#[contractevent]
+pub struct DisputeRejected {
+    pub proof_id_hash: BytesN<32>,
+    pub rejected_by: Address,
+    pub rejected_by_class: DisputeActorClass,
+    pub rejected_at: u64,
 }
 
 #[contractimpl]
@@ -544,6 +592,110 @@ impl ProofRegistryContract {
         }
     }
 
+    // ── dispute lifecycle ─────────────────────────────────────────────────────
+
+    /// Opens a dispute against a proof, recording a commitment to off-chain
+    /// evidence rather than the evidence itself.
+    ///
+    /// `disputant` must authorize the call; any address may dispute any
+    /// proof regardless of the proof's current status — dispute state is
+    /// tracked entirely independently of `is_valid_proof`, `is_revoked`, and
+    /// expiration, so opening (or resolving, or rejecting) a dispute never
+    /// changes a proof's validity, and revoking or expiring a proof never
+    /// changes its dispute state.
+    ///
+    /// Fails with [`ProofError::DisputeAlreadyOpen`] if this proof already
+    /// has a dispute whose status is `Open`: at most one dispute may be open
+    /// per proof at a time. A prior dispute that reached `Withdrawn`,
+    /// `Resolved`, or `Rejected` does not block a new one — opening again
+    /// simply overwrites that terminal record.
+    pub fn open_dispute(
+        env: Env,
+        proof_id_hash: BytesN<32>,
+        disputant: Address,
+        evidence_commitment: BytesN<32>,
+    ) -> Result<(), ProofError> {
+        Self::ensure_not_decommissioned(&env)?;
+        if let Ok(protocol_config) = Self::get_protocol_config(env.clone()) {
+            let protocol_client = ProtocolConfigContractClient::new(&env, &protocol_config);
+            if protocol_client.is_scope_paused(&PauseScope::Disputes) {
+                return Err(ProofError::ContractPaused);
+            }
+        }
+
+        // Confirm the proof exists (any status is disputable).
+        let proof_key = DataKey::Proof(proof_id_hash.clone());
+        let proof: ProofRecord = env
+            .storage()
+            .persistent()
+            .get(&proof_key)
+            .ok_or(ProofError::ProofNotFound)?;
+
+        Self::require_auth(&disputant);
+
+        if let Some(existing) = Self::read_dispute(&env, &proof_id_hash) {
+            if existing.status == DisputeStatus::Open {
+                return Err(ProofError::DisputeAlreadyOpen);
+            }
+        }
+
+        let actor_class = Self::classify_actor(&env, &disputant, &proof.issuer_address);
+        let now = env.ledger().timestamp();
+        let record = DisputeRecord {
+            proof_id_hash: proof_id_hash.clone(),
+            evidence_commitment,
+            status: DisputeStatus::Open,
+            opened_by: disputant.clone(),
+            opened_by_class: actor_class,
+            updated_by: disputant.clone(),
+            updated_by_class: actor_class,
+            opened_at: now,
+            updated_at: now,
+        };
+
+        let dispute_key = DataKey::Dispute(proof_id_hash.clone());
+        env.storage().persistent().set(&dispute_key, &record);
+        Self::extend_proof_key_ttl(env.clone(), &dispute_key);
+
+        DisputeOpened {
+            proof_id_hash,
+            opened_by: disputant,
+            opened_by_class: actor_class,
+            opened_at: now,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Withdraws an open dispute. Only the address that opened it may
+    /// withdraw it — not the admin, and not the proof's issuer unless the
+    /// issuer is the one who opened it.
+    pub fn withdraw_dispute(env: Env, proof_id_hash: BytesN<32>) -> Result<(), ProofError> {
+        Self::transition_dispute(env, proof_id_hash, DisputeTransition::Withdraw)
+    }
+
+    /// Admin-only: resolves an open dispute in the disputant's favor.
+    pub fn resolve_dispute(env: Env, proof_id_hash: BytesN<32>) -> Result<(), ProofError> {
+        Self::transition_dispute(env, proof_id_hash, DisputeTransition::Resolve)
+    }
+
+    /// Admin-only: rejects an open dispute as without merit.
+    pub fn reject_dispute(env: Env, proof_id_hash: BytesN<32>) -> Result<(), ProofError> {
+        Self::transition_dispute(env, proof_id_hash, DisputeTransition::Reject)
+    }
+
+    /// Returns the current dispute record for a proof, if one exists.
+    pub fn get_dispute(env: Env, proof_id_hash: BytesN<32>) -> Result<DisputeRecord, ProofError> {
+        let key = DataKey::Dispute(proof_id_hash);
+        let record = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ProofError::DisputeNotFound)?;
+        Self::extend_proof_key_ttl(env, &key);
+        Ok(record)
+    }
+
     pub fn nominate_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
         Self::ensure_not_decommissioned(&env).map_err(|_| ContractError::InvalidState)?;
         let admin = Self::get_admin(env.clone())?;
@@ -831,6 +983,120 @@ impl ProofRegistryContract {
             .extend_ttl(key, TTL_THRESHOLD_LEDGERS, TTL_EXTEND_TO_LEDGERS);
     }
 
+    fn read_dispute(env: &Env, proof_id_hash: &BytesN<32>) -> Option<DisputeRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Dispute(proof_id_hash.clone()))
+    }
+
+    /// Classifies `actor` relative to a proof: the proof's own issuer, this
+    /// contract's admin, or neither.
+    fn classify_actor(env: &Env, actor: &Address, issuer_address: &Address) -> DisputeActorClass {
+        if actor == issuer_address {
+            return DisputeActorClass::Issuer;
+        }
+        if let Ok(admin) = Self::get_admin(env.clone()) {
+            if actor == &admin {
+                return DisputeActorClass::Admin;
+            }
+        }
+        DisputeActorClass::ThirdParty
+    }
+
+    /// Shared implementation behind [`Self::withdraw_dispute`],
+    /// [`Self::resolve_dispute`], and [`Self::reject_dispute`]: every
+    /// terminal dispute transition requires an `Open` dispute, is checked
+    /// against the `Disputes` pause scope, authorizes the transition's own
+    /// actor (the opener for withdrawal, the admin for resolution and
+    /// rejection), and emits the matching typed event with that actor's
+    /// class and the ledger timestamp.
+    fn transition_dispute(
+        env: Env,
+        proof_id_hash: BytesN<32>,
+        transition: DisputeTransition,
+    ) -> Result<(), ProofError> {
+        Self::ensure_not_decommissioned(&env)?;
+        if let Ok(protocol_config) = Self::get_protocol_config(env.clone()) {
+            let protocol_client = ProtocolConfigContractClient::new(&env, &protocol_config);
+            if protocol_client.is_scope_paused(&PauseScope::Disputes) {
+                return Err(ProofError::ContractPaused);
+            }
+        }
+
+        let key = DataKey::Dispute(proof_id_hash.clone());
+        let mut record: DisputeRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ProofError::DisputeNotFound)?;
+
+        if record.status != DisputeStatus::Open {
+            return Err(ProofError::DisputeNotOpen);
+        }
+
+        let (actor, new_status) = match transition {
+            DisputeTransition::Withdraw => {
+                let opener = record.opened_by.clone();
+                Self::require_auth(&opener);
+                (opener, DisputeStatus::Withdrawn)
+            }
+            DisputeTransition::Resolve => {
+                let admin =
+                    Self::get_admin(env.clone()).map_err(|_| ProofError::DisputeNotFound)?;
+                Self::require_auth(&admin);
+                (admin, DisputeStatus::Resolved)
+            }
+            DisputeTransition::Reject => {
+                let admin =
+                    Self::get_admin(env.clone()).map_err(|_| ProofError::DisputeNotFound)?;
+                Self::require_auth(&admin);
+                (admin, DisputeStatus::Rejected)
+            }
+        };
+
+        let proof_key = DataKey::Proof(proof_id_hash.clone());
+        let proof: ProofRecord = env
+            .storage()
+            .persistent()
+            .get(&proof_key)
+            .ok_or(ProofError::ProofNotFound)?;
+        let actor_class = Self::classify_actor(&env, &actor, &proof.issuer_address);
+
+        let now = env.ledger().timestamp();
+        record.status = new_status;
+        record.updated_by = actor.clone();
+        record.updated_by_class = actor_class;
+        record.updated_at = now;
+        env.storage().persistent().set(&key, &record);
+        Self::extend_proof_key_ttl(env.clone(), &key);
+
+        match transition {
+            DisputeTransition::Withdraw => DisputeWithdrawn {
+                proof_id_hash,
+                withdrawn_by: actor,
+                withdrawn_by_class: actor_class,
+                withdrawn_at: now,
+            }
+            .publish(&env),
+            DisputeTransition::Resolve => DisputeResolved {
+                proof_id_hash,
+                resolved_by: actor,
+                resolved_by_class: actor_class,
+                resolved_at: now,
+            }
+            .publish(&env),
+            DisputeTransition::Reject => DisputeRejected {
+                proof_id_hash,
+                rejected_by: actor,
+                rejected_by_class: actor_class,
+                rejected_at: now,
+            }
+            .publish(&env),
+        }
+
+        Ok(())
+    }
+
     pub fn get_migration_status(env: Env) -> Option<MigrationStatus> {
         env.storage().instance().get(&DataKey::MigrationStatus)
     }
@@ -916,7 +1182,10 @@ mod test {
     extern crate std;
 
     use super::{DataKey, ProofRegistryContract, ProofRegistryContractClient};
-    use earnproof_shared::{ProofError, ProofStatus, ProofValidity, TTL_THRESHOLD_LEDGERS};
+    use earnproof_shared::{
+        DisputeActorClass, DisputeStatus, ProofError, ProofStatus, ProofValidity,
+        TTL_THRESHOLD_LEDGERS,
+    };
     use issuer_registry::{IssuerRegistryContract, IssuerRegistryContractClient};
     use protocol_config::{ProtocolConfigContract, ProtocolConfigContractClient};
     use soroban_sdk::{
@@ -2690,5 +2959,448 @@ mod test {
             client.get_proof_validity(&bytes(&env, 99)),
             ProofValidity::NotFound
         );
+    }
+
+    // ── proof dispute status lifecycle ──────────────────────────────────────────
+
+    const THIRD_PARTY: &str = "GDWUSKGGFDI4FRXK5EBTRECZSVQSSWJHHJOGH6JWG3AUMFFMQ435DIAG";
+
+    #[test]
+    fn open_dispute_by_issuer_is_classified_and_observable() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        let dispute = client.get_dispute(&proof_id);
+        assert_eq!(dispute.status, DisputeStatus::Open);
+        assert_eq!(dispute.opened_by, issuer);
+        assert_eq!(dispute.opened_by_class, DisputeActorClass::Issuer);
+        assert_eq!(dispute.evidence_commitment, bytes(&env, 30));
+    }
+
+    #[test]
+    fn open_dispute_by_admin_and_third_party_are_classified_correctly() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let admin = Address::from_str(&env, ADMIN);
+        let third_party = Address::from_str(&env, THIRD_PARTY);
+
+        let proof_a = bytes(&env, 1);
+        let proof_b = bytes(&env, 2);
+        client.register_proof(&proof_a, &bytes(&env, 11), &issuer, &1, &2_000);
+        client.register_proof(&proof_b, &bytes(&env, 12), &issuer, &1, &2_000);
+
+        client.open_dispute(&proof_a, &admin, &bytes(&env, 30));
+        client.open_dispute(&proof_b, &third_party, &bytes(&env, 31));
+
+        assert_eq!(
+            client.get_dispute(&proof_a).opened_by_class,
+            DisputeActorClass::Admin
+        );
+        assert_eq!(
+            client.get_dispute(&proof_b).opened_by_class,
+            DisputeActorClass::ThirdParty
+        );
+    }
+
+    #[test]
+    fn open_dispute_requires_disputant_auth() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let third_party = Address::from_str(&env, THIRD_PARTY);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        env.set_auths(&[]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.open_dispute(&proof_id, &third_party, &bytes(&env, 30));
+        }));
+        assert!(
+            result.is_err(),
+            "opening a dispute must require the disputant's auth"
+        );
+    }
+
+    #[test]
+    fn open_dispute_rejects_unknown_proof() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+
+        let result = client.try_open_dispute(&bytes(&env, 99), &issuer, &bytes(&env, 30));
+        assert_eq!(result, Err(Ok(ProofError::ProofNotFound)));
+    }
+
+    #[test]
+    fn only_one_open_dispute_is_allowed_at_a_time() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let third_party = Address::from_str(&env, THIRD_PARTY);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+        let result = client.try_open_dispute(&proof_id, &third_party, &bytes(&env, 31));
+        assert_eq!(result, Err(Ok(ProofError::DisputeAlreadyOpen)));
+
+        // The rejected attempt must not have overwritten the existing dispute.
+        let dispute = client.get_dispute(&proof_id);
+        assert_eq!(dispute.opened_by, issuer);
+        assert_eq!(dispute.evidence_commitment, bytes(&env, 30));
+    }
+
+    #[test]
+    fn a_new_dispute_may_be_opened_once_the_prior_one_is_terminal() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let third_party = Address::from_str(&env, THIRD_PARTY);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+        client.withdraw_dispute(&proof_id);
+
+        // Withdrawn is terminal, not blocking: a new dispute may be opened.
+        client.open_dispute(&proof_id, &third_party, &bytes(&env, 31));
+        let dispute = client.get_dispute(&proof_id);
+        assert_eq!(dispute.status, DisputeStatus::Open);
+        assert_eq!(dispute.opened_by, third_party);
+        assert_eq!(dispute.evidence_commitment, bytes(&env, 31));
+    }
+
+    #[test]
+    fn withdraw_dispute_succeeds_for_the_real_opener() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let third_party = Address::from_str(&env, THIRD_PARTY);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        client.open_dispute(&proof_id, &third_party, &bytes(&env, 30));
+
+        client.withdraw_dispute(&proof_id);
+        let dispute = client.get_dispute(&proof_id);
+        assert_eq!(dispute.status, DisputeStatus::Withdrawn);
+        assert_eq!(dispute.updated_by, third_party);
+        assert_eq!(dispute.updated_by_class, DisputeActorClass::ThirdParty);
+    }
+
+    #[test]
+    fn withdraw_dispute_rejects_an_authorized_address_that_is_not_the_opener() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        // env.mock_all_auths() would authorize any caller for any
+        // require_auth, which would make a test that only checks "someone
+        // authorized this" pass even if the contract never checked *whose*
+        // authorization it required. Using an explicit MockAuth instead
+        // proves the contract requires the opener specifically: another
+        // party's own, valid authorization for this exact call is not
+        // enough.
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let third_party = Address::from_str(&env, THIRD_PARTY);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        let auth_entry = MockAuth {
+            address: &third_party,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "withdraw_dispute",
+                args: (proof_id.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.mock_auths(&[auth_entry]).withdraw_dispute(&proof_id);
+        }));
+        assert!(
+            result.is_err(),
+            "a third party's own authorization must not withdraw the issuer's dispute"
+        );
+        assert_eq!(client.get_dispute(&proof_id).status, DisputeStatus::Open);
+    }
+
+    #[test]
+    fn withdraw_dispute_rejects_not_found_and_not_open() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        // No dispute at all.
+        let result = client.try_withdraw_dispute(&proof_id);
+        assert_eq!(result, Err(Ok(ProofError::DisputeNotFound)));
+
+        // Already withdrawn: not open.
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+        client.withdraw_dispute(&proof_id);
+        let result = client.try_withdraw_dispute(&proof_id);
+        assert_eq!(result, Err(Ok(ProofError::DisputeNotOpen)));
+    }
+
+    #[test]
+    fn resolve_dispute_is_admin_only_and_terminal() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let admin = Address::from_str(&env, ADMIN);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        env.set_auths(&[]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.resolve_dispute(&proof_id);
+        }));
+        assert!(
+            result.is_err(),
+            "resolving a dispute must require admin auth"
+        );
+
+        env.mock_all_auths();
+        client.resolve_dispute(&proof_id);
+        let dispute = client.get_dispute(&proof_id);
+        assert_eq!(dispute.status, DisputeStatus::Resolved);
+        assert_eq!(dispute.updated_by, admin);
+        assert_eq!(dispute.updated_by_class, DisputeActorClass::Admin);
+
+        // Terminal: cannot be resolved or rejected again.
+        assert_eq!(
+            client.try_resolve_dispute(&proof_id),
+            Err(Ok(ProofError::DisputeNotOpen))
+        );
+        assert_eq!(
+            client.try_reject_dispute(&proof_id),
+            Err(Ok(ProofError::DisputeNotOpen))
+        );
+    }
+
+    #[test]
+    fn reject_dispute_is_admin_only_and_terminal() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let admin = Address::from_str(&env, ADMIN);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        env.set_auths(&[]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.reject_dispute(&proof_id);
+        }));
+        assert!(
+            result.is_err(),
+            "rejecting a dispute must require admin auth"
+        );
+
+        env.mock_all_auths();
+        client.reject_dispute(&proof_id);
+        let dispute = client.get_dispute(&proof_id);
+        assert_eq!(dispute.status, DisputeStatus::Rejected);
+        assert_eq!(dispute.updated_by, admin);
+        assert_eq!(dispute.updated_by_class, DisputeActorClass::Admin);
+    }
+
+    #[test]
+    fn resolve_and_reject_reject_not_found_and_not_open() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        assert_eq!(
+            client.try_resolve_dispute(&proof_id),
+            Err(Ok(ProofError::DisputeNotFound))
+        );
+        assert_eq!(
+            client.try_reject_dispute(&proof_id),
+            Err(Ok(ProofError::DisputeNotFound))
+        );
+
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+        client.resolve_dispute(&proof_id);
+
+        assert_eq!(
+            client.try_resolve_dispute(&proof_id),
+            Err(Ok(ProofError::DisputeNotOpen))
+        );
+        assert_eq!(
+            client.try_reject_dispute(&proof_id),
+            Err(Ok(ProofError::DisputeNotOpen))
+        );
+    }
+
+    #[test]
+    fn get_dispute_reports_not_found() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let result = client.try_get_dispute(&bytes(&env, 99));
+        assert_eq!(result, Err(Ok(ProofError::DisputeNotFound)));
+    }
+
+    #[test]
+    fn dispute_status_is_independent_of_proof_validity_and_revocation() {
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        // Disputing an active, valid proof does not change its validity.
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+        assert!(client.is_valid_proof(&proof_id));
+        assert_eq!(client.get_proof(&proof_id).status, ProofStatus::Active);
+
+        // Revoking a disputed proof is irreversible and does not change the
+        // dispute's own status: revocation and dispute state are tracked
+        // independently.
+        client.revoke_proof(&proof_id);
+        assert!(!client.is_valid_proof(&proof_id));
+        assert_eq!(client.get_proof(&proof_id).status, ProofStatus::Revoked);
+        assert_eq!(client.get_dispute(&proof_id).status, DisputeStatus::Open);
+
+        // Resolving the dispute afterward does not un-revoke the proof.
+        client.resolve_dispute(&proof_id);
+        assert_eq!(
+            client.get_dispute(&proof_id).status,
+            DisputeStatus::Resolved
+        );
+        assert!(!client.is_valid_proof(&proof_id));
+        assert_eq!(client.get_proof(&proof_id).status, ProofStatus::Revoked);
+    }
+
+    #[test]
+    fn a_revoked_proof_can_still_be_disputed() {
+        // Dispute status operates independently from revocation in both
+        // directions: revoking first does not block opening a dispute later.
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        client.revoke_proof(&proof_id);
+
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+        assert_eq!(client.get_dispute(&proof_id).status, DisputeStatus::Open);
+    }
+
+    #[test]
+    fn dispute_transitions_reject_when_disputes_are_paused() {
+        let (env, client, pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        pc.set_scoped_pause(&earnproof_shared::PauseScope::Disputes, &true);
+
+        assert_eq!(
+            client.try_open_dispute(&bytes(&env, 2), &issuer, &bytes(&env, 31)),
+            Err(Ok(ProofError::ContractPaused))
+        );
+        assert_eq!(
+            client.try_withdraw_dispute(&proof_id),
+            Err(Ok(ProofError::ContractPaused))
+        );
+        assert_eq!(
+            client.try_resolve_dispute(&proof_id),
+            Err(Ok(ProofError::ContractPaused))
+        );
+        assert_eq!(
+            client.try_reject_dispute(&proof_id),
+            Err(Ok(ProofError::ContractPaused))
+        );
+
+        // Unrelated global pause does not block disputes: this scope is
+        // opted in explicitly, unlike Registration/Updates.
+        pc.set_scoped_pause(&earnproof_shared::PauseScope::Disputes, &false);
+        pc.pause();
+        client.withdraw_dispute(&proof_id);
+        assert_eq!(
+            client.get_dispute(&proof_id).status,
+            DisputeStatus::Withdrawn
+        );
+    }
+
+    #[test]
+    fn dispute_transitions_reject_on_decommissioned_contract() {
+        let (env, client, ..) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let admin = Address::from_str(&env, ADMIN);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        client.nominate_successor(&admin);
+        client.activate_successor();
+
+        assert_eq!(
+            client.try_open_dispute(&bytes(&env, 2), &issuer, &bytes(&env, 31)),
+            Err(Ok(ProofError::ProofNotFound))
+        );
+        assert_eq!(
+            client.try_withdraw_dispute(&proof_id),
+            Err(Ok(ProofError::ProofNotFound))
+        );
+        assert_eq!(
+            client.try_resolve_dispute(&proof_id),
+            Err(Ok(ProofError::ProofNotFound))
+        );
+        assert_eq!(
+            client.try_reject_dispute(&proof_id),
+            Err(Ok(ProofError::ProofNotFound))
+        );
+    }
+
+    #[test]
+    fn dispute_events_carry_actor_class_and_ledger_metadata() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, ScAddress, ScVal};
+        use soroban_sdk::{Map, Symbol, TryFromVal, Val};
+
+        let (env, client, _pc, _ir, _ir_id) = setup();
+        let issuer = Address::from_str(&env, ISSUER);
+        let proof_id = bytes(&env, 1);
+        client.register_proof(&proof_id, &bytes(&env, 2), &issuer, &1, &2_000);
+
+        client.open_dispute(&proof_id, &issuer, &bytes(&env, 30));
+
+        let events = env.events().all();
+        let matching: std::vec::Vec<(BytesN<32>, u64)> = events
+            .events()
+            .iter()
+            .filter_map(|event| {
+                let contract_id = event.contract_id.clone()?;
+                let emitting_contract =
+                    Address::try_from_val(&env, &ScVal::Address(ScAddress::Contract(contract_id)))
+                        .ok()?;
+                if emitting_contract != client.address {
+                    return None;
+                }
+                let ContractEventBody::V0(body) = &event.body;
+                let first_topic = body.topics.first()?;
+                let first_topic_val = Val::try_from_val(&env, first_topic).ok()?;
+                let discriminant = Symbol::try_from_val(&env, &first_topic_val).ok()?;
+                if discriminant != Symbol::new(&env, "dispute_opened") {
+                    return None;
+                }
+                let data_val = Val::try_from_val(&env, &body.data).ok()?;
+                let map = Map::<Symbol, Val>::try_from_val(&env, &data_val).ok()?;
+                let class_raw = map.get(Symbol::new(&env, "opened_by_class"))?;
+                let class: DisputeActorClass =
+                    DisputeActorClass::try_from_val(&env, &class_raw).ok()?;
+                assert_eq!(class, DisputeActorClass::Issuer);
+                let ledger_raw = map.get(Symbol::new(&env, "opened_at"))?;
+                let ledger_time: u64 = u64::try_from_val(&env, &ledger_raw).ok()?;
+                Some((bytes(&env, 1), ledger_time))
+            })
+            .collect();
+
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one dispute_opened event expected"
+        );
+        assert_eq!(matching[0].1, env.ledger().timestamp());
     }
 }

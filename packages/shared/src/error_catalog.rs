@@ -155,7 +155,7 @@ pub struct ErrorSpec {
 }
 
 /// Every published error, ordered by code.
-pub const ERROR_CATALOG: [ErrorSpec; 27] = [
+pub const ERROR_CATALOG: [ErrorSpec; 30] = [
     ErrorSpec {
         code: 1,
         name: "AlreadyInitialized",
@@ -479,6 +479,42 @@ pub const ERROR_CATALOG: [ErrorSpec; 27] = [
         remediation: "Choose an activation time strictly before the expiration.",
         http_status: 400,
         client_message: "Invalid activation time",
+    },
+    ErrorSpec {
+        code: 313,
+        name: "DisputeAlreadyOpen",
+        enum_name: "ProofError",
+        domain: Domain::ProofRegistry,
+        status: Status::Returned,
+        cause: "open_dispute was called for a proof that already has an Open dispute.",
+        retry: Retry::Never,
+        remediation: "Withdraw, resolve, or reject the existing dispute before opening a new one. Retrying the identical request will not help: the dispute is cleared by a different call (from the disputant or the admin), not by this one succeeding on its own.",
+        http_status: 409,
+        client_message: "A dispute is already open for this proof",
+    },
+    ErrorSpec {
+        code: 314,
+        name: "DisputeNotFound",
+        enum_name: "ProofError",
+        domain: Domain::ProofRegistry,
+        status: Status::Returned,
+        cause: "withdraw_dispute, resolve_dispute, or reject_dispute referenced a proof with no dispute record.",
+        retry: Retry::AfterCallerChange,
+        remediation: "Open a dispute first, or confirm the proof id.",
+        http_status: 404,
+        client_message: "No dispute found for this proof",
+    },
+    ErrorSpec {
+        code: 315,
+        name: "DisputeNotOpen",
+        enum_name: "ProofError",
+        domain: Domain::ProofRegistry,
+        status: Status::Returned,
+        cause: "A dispute transition was attempted on a dispute that is not Open (already withdrawn, resolved, or rejected).",
+        retry: Retry::Never,
+        remediation: "Read the dispute's current status; it is terminal once withdrawn, resolved, or rejected.",
+        http_status: 400,
+        client_message: "Dispute is not open",
     },
 ];
 

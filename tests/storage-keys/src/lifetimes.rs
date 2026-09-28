@@ -108,10 +108,11 @@ fn per_record_namespaces_hold_one_entry_per_record() {
         12
     );
 
-    // Two proofs, one of them revoked in place.
+    // Two proofs, one of them revoked in place, plus one dispute opened
+    // against the other.
     assert_eq!(
         keys_in(env, &deployment.proofs_id, StorageClass::Persistent).len(),
-        2
+        3
     );
 
     // Two schema versions plus one scoped pause.

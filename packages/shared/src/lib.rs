@@ -285,6 +285,20 @@ pub enum ProofError {
     /// after `expires_at`, so the proof could never be valid.
     /// Recovery: choose an activation time strictly before the expiration.
     InvalidActivationTime = 312,
+    /// `open_dispute` was called for a proof that already has an `Open`
+    /// dispute. Recovery: withdraw, resolve, or reject the existing dispute
+    /// before opening a new one — retrying the identical request will not
+    /// help, since the dispute is cleared by a different call, not by this
+    /// one succeeding on its own.
+    DisputeAlreadyOpen = 313,
+    /// `withdraw_dispute`, `resolve_dispute`, or `reject_dispute` referenced
+    /// a proof with no dispute record.
+    /// Recovery: open a dispute first, or confirm the proof id.
+    DisputeNotFound = 314,
+    /// A dispute transition was attempted on a dispute that is not `Open`
+    /// (already withdrawn, resolved, or rejected).
+    /// Recovery: read the dispute's current status; it is terminal.
+    DisputeNotOpen = 315,
 }
 
 #[contracttype]
@@ -295,6 +309,7 @@ pub enum PauseScope {
     Updates,
     Revocation,
     Upgrades,
+    Disputes,
 }
 
 #[contracttype]
@@ -401,6 +416,64 @@ pub struct ProofRegistrationInput {
     pub commitment_hash: BytesN<32>,
     pub schema_version: u32,
     pub expires_at: u64,
+}
+
+/// Lifecycle state of a proof dispute. Terminal once `Withdrawn`, `Resolved`,
+/// or `Rejected`: none of those transitions back to `Open`, and a new
+/// dispute can only be opened once the previous one has reached one of them.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DisputeStatus {
+    /// Under review. The only status a proof may have at most one of at a
+    /// time.
+    Open,
+    /// Withdrawn by whoever opened it, before any resolution.
+    Withdrawn,
+    /// Resolved by the admin in the disputant's favor.
+    Resolved,
+    /// Rejected by the admin as without merit.
+    Rejected,
+}
+
+/// Coarse category of who took a dispute action, recorded alongside the
+/// address itself so an indexer can distinguish "the issuer disputed their
+/// own proof" from "a third party disputed it" without re-deriving it from
+/// other contract state.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum DisputeActorClass {
+    /// The address is the proof's own recorded issuer.
+    Issuer,
+    /// The address is the proof-registry contract's admin.
+    Admin,
+    /// Any other address.
+    ThirdParty,
+}
+
+/// Bounded, on-chain dispute state for one proof.
+///
+/// Deliberately does not store raw evidence or a free-form reason: only a
+/// commitment hash to evidence held off-chain, mirroring how issuer-registry
+/// records a `reason_commitment` rather than the reason text itself. Dispute
+/// status is tracked independently of `ProofRecord.status`: opening,
+/// resolving, or rejecting a dispute never changes a proof's validity or
+/// revocation state, and revoking or expiring a proof never changes its
+/// dispute state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub proof_id_hash: BytesN<32>,
+    /// Hash of off-chain evidence. Never the evidence itself.
+    pub evidence_commitment: BytesN<32>,
+    pub status: DisputeStatus,
+    pub opened_by: Address,
+    pub opened_by_class: DisputeActorClass,
+    pub opened_at: u64,
+    /// Address that produced the current `status` — the opener while still
+    /// `Open`, or whoever withdrew/resolved/rejected it.
+    pub updated_by: Address,
+    pub updated_by_class: DisputeActorClass,
+    pub updated_at: u64,
 }
 
 #[contracttype]

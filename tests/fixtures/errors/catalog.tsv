@@ -28,3 +28,6 @@
 310	MalformedInput	ProofError	proof-registry	reserved	after-caller-change	400
 311	InvalidBatchSize	ProofError	proof-registry	returned	after-caller-change	400
 312	InvalidActivationTime	ProofError	proof-registry	returned	after-caller-change	400
+313	DisputeAlreadyOpen	ProofError	proof-registry	returned	never	409
+314	DisputeNotFound	ProofError	proof-registry	returned	after-caller-change	404
+315	DisputeNotOpen	ProofError	proof-registry	returned	never	400

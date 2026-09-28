@@ -290,6 +290,7 @@ pub fn exercised_deployment() -> Deployment {
         &1_000_000,
     );
     proofs.revoke_proof(&bytes32(&env, 7));
+    proofs.open_dispute(&proof_id, &rotated_issuer, &bytes32(&env, 30));
     config.pause();
 
     config.begin_migration(&2, &1);
